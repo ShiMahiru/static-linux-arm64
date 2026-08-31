@@ -1,0 +1,108 @@
+# 每 30 分钟检查上游 QuantumNous/new-api 的 main 分支是否有新 commit，
+# 有才构建静态 ARM64 二进制（F50 用），没有就跳过。
+name: track-upstream-main
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'       # 每 30 分钟一次
+  workflow_dispatch:             # 手动触发
+
+env:
+  UPSTREAM_REPO: QuantumNous/new-api
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1) 拿到上游 main 最新 commit SHA ──────────────────
+      - name: Get upstream latest commit
+        id: upstream
+        run: |
+          SHA=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/commits/main" | grep -o '"sha": *"[0-9a-f]\{40\}"' | head -1 | cut -d'"' -f4)
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "upstream sha = ${SHA}"
+
+      # ── 2) 拿上一次成功构建时记录的 SHA（用 cache 存） ──────
+      - name: Restore last-built sha cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .last-built-sha
+          key: new-api-upstream-sha
+          save-always: true
+
+      - name: Compare and skip if unchanged
+        run: |
+          UPSTREAM_SHA="${{ steps.upstream.outputs.sha }}"
+          LAST_SHA=""
+          [ -f .last-built-sha ] && LAST_SHA=$(cat .last-built-sha)
+          echo "last built sha = ${LAST_SHA:-none}"
+          if [ -z "$UPSTREAM_SHA" ]; then
+            echo "无法获取上游 SHA，跳过本次构建"
+            echo 'SKIP=true' >> "$GITHUB_ENV"
+          elif [ "$UPSTREAM_SHA" = "$LAST_SHA" ]; then
+            echo "No new commit, skip build."
+            echo 'SKIP=true' >> "$GITHUB_ENV"
+          else
+            echo "New commit detected, building..."
+            echo 'SKIP=false' >> "$GITHUB_ENV"
+            echo "$UPSTREAM_SHA" > .last-built-sha
+          fi
+
+      # ── 3) 没有新 commit 就直接结束 ────────────────────────
+      - name: Skip
+        if: env.SKIP == 'true'
+        run: exit 0
+
+      # ── 4) 拉取上游源码 ─────────────────────────────────
+      - name: Checkout upstream
+        if: env.SKIP == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: main
+
+      - name: Setup Go
+        if: env.SKIP == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Setup Node
+        if: env.SKIP == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # ── 5) 构建前端（go:embed 会内嵌 web/dist） ──────────
+      - name: Build frontend
+        if: env.SKIP == 'false'
+        working-directory: web
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      # ── 6) 静态 ARM64 二进制（F50 用） ──────────────────
+      - name: Build static ARM64 binary
+        if: env.SKIP == 'false'
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -ldflags "-s -w" -o new-api ./main.go
+          ls -la new-api
+          ( readelf -l new-api 2>/dev/null | grep -i interpreter && echo "!! 仍是动态链接" ) || echo "OK: 无 interpreter 依赖"
+
+      - name: Package binary
+        if: env.SKIP == 'false'
+        run: |
+          mkdir -p dist
+          cp new-api dist/new-api
+          tar -czvf new-api-android-arm64.tar.gz -C dist new-api
+
+      - name: Upload binary artifact
+        if: env.SKIP == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-api-android-arm64
+          path: new-api-android-arm64.tar.gz
+          retention-days: 7
